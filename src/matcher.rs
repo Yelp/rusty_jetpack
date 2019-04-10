@@ -1,7 +1,7 @@
 use crossbeam_channel::{Receiver, Sender};
 use lazy_static::lazy_static;
 use memmap::MmapOptions;
-use regex::Regex;
+use regex::{Regex, RegexSet};
 use serde::Deserialize;
 use serde_regex;
 use tempfile::NamedTempFile;
@@ -24,12 +24,25 @@ const SUPPORT_MAPPING_CSV: &str = include_str!("../android_support_mappings.csv"
 const DATABIND_MAPPING_CSV: &str = include_str!("../android_databinding_mappings.csv");
 const ARCH_MAPPING_CSV: &str = include_str!("../android_arch_mappings.csv");
 
+// Also include the artifact mappings so it's easy to know what packages you actually need to
+// replace. Since it's quite a bit more complex than just find and replace for the artifacts,
+// printing out the ones actually used in the project is good enough.
+const ARTIFACT_MAPPING_CSV: &str = include_str!("../android_artifact_mappings.csv");
+
 #[derive(Debug, Deserialize)]
 struct Mapping {
     #[serde(with = "serde_regex", rename = "Support Library class")]
     pattern: Regex,
     #[serde(rename = "Android X class")]
     replacement: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ArtifactMapping {
+    #[serde(with = "serde_regex", rename = "Old build artifact")]
+    pub pattern: Regex,
+    #[serde(rename = "AndroidX build artifact")]
+    pub replacement: String,
 }
 
 // Compiling the regex patterns is decently expensive and since they are used across all possible
@@ -91,40 +104,57 @@ lazy_static! {
     };
     static ref ARCH_MIN_MATCH_LEN: usize = ARCH_MAPPINGS.last().unwrap().pattern.as_str().len();
     static ref ARCH_MIN_MATCH: Regex = Regex::new(r#"[ </"@']android\.arch"#).unwrap();
+
+    // Regex anc checks for artifact changes
+    static ref ARTIFACT_MAPPINGS: Vec<ArtifactMapping> = {
+        let mut vec = Vec::new();
+        let mut rdr = csv::Reader::from_reader(ARTIFACT_MAPPING_CSV.as_bytes());
+        for result in rdr.deserialize() {
+            let mapping: ArtifactMapping = result.unwrap();
+            vec.push(mapping)
+        }
+        vec.sort_unstable_by(|a, b| b.pattern.as_str().len().cmp(&a.pattern.as_str().len()));
+        vec
+    };
+    static ref ARTIFACT_MIN_MATCH_LEN: usize =
+        ARTIFACT_MAPPINGS.last().unwrap().pattern.as_str().len();
+    static ref ARTIFACT_MIN_MATCH: RegexSet = RegexSet::new(&[
+        r#"["'']com\.android\.support[a-z\.]*:"#,
+        r#"["']android\.arch[a-z\.]*:"#
+    ]).unwrap();
 }
 
 pub struct MatchInfo {
+    pub matcher_id: usize,
     pub path: PathBuf,
     pub matches_found: usize,
-    pub matcher_id: usize,
+    pub artifacts_found: Vec<&'static ArtifactMapping>,
 }
 
-pub struct Matcher;
+pub struct Matcher {
+    id: usize,
+    tx: Sender<Result<MatchInfo>>,
+}
 
 impl Matcher {
-    pub fn new() -> Self {
-        Matcher
+    /// Create a Matcher
+    ///
+    /// * `id` - The thread number of the matcher
+    /// * `tx` - The transmitter to send information with
+    pub fn new(id: usize, tx: Sender<Result<MatchInfo>>) -> Self {
+        Matcher { id, tx }
     }
 
     /// Start the matcher.
     ///
     /// The matcher will wait on receiving a file to operate on from the given receiver, and will
     /// then finish once the receiver channel signals it is both empty and disconnected.
+    /// Information on completion of checking a file will be sent via the Matcher's transmitter.
     ///
-    /// * `id` - The thread number of the matcher
     /// * `rx` - The receiver to listen to for files
-    /// * `tx` - The transmitter to send information with
-    pub fn run(&self, id: usize, rx: Receiver<PathBuf>, tx: Sender<Result<MatchInfo>>) {
+    pub fn run(self, rx: Receiver<PathBuf>) {
         while let Ok(path) = rx.recv() {
-            let info: Result<MatchInfo> = match self.search_and_replace(&path) {
-                Ok(matches_found) => Ok(MatchInfo {
-                    path,
-                    matches_found,
-                    matcher_id: id,
-                }),
-                Err(e) => Err(e),
-            };
-            let _ = tx.send(info);
+            let _ = self.tx.send(self.search_and_replace(path));
         }
     }
 
@@ -140,22 +170,34 @@ impl Matcher {
     /// disk and overwrites the original file with the same attributes.
     ///
     /// * `path` - The file path to operate on
-    /// Returns a result with the number of replacements made if successful
-    fn search_and_replace(&self, path: &PathBuf) -> Result<usize> {
-        let file = fs::File::open(path)?;
+    /// Returns a MatchInfo with information about any matches in the line if successful
+    fn search_and_replace(&self, path: PathBuf) -> Result<MatchInfo> {
+        let file = fs::File::open(&path)?;
         let mmap = unsafe { MmapOptions::new().map(&file)? };
         let source = mmap.deref();
 
-        let mut tempfile = NamedTempFile::new_in(path.parent().unwrap_or(&path))?;
+        // To make sure not too much performance is lost finding artifacts assume that artifacts
+        // can only be located in the buildSrc directory, a top level file in the project or one
+        // level down for module's build files.
+        let check_artifact = path.extension().map_or(false, |x| x != "xml" && x != "pro")
+            && (path.starts_with("buildSrc")
+                || path.parent().map_or(true, |x| x.parent().is_none()));
+
+        let mut tempfile = NamedTempFile::new_in(&path.parent().unwrap_or(&path))?;
         let mut replacements = 0;
+        let mut artifacts: Vec<&'static ArtifactMapping> = Vec::new();
         for line in str::from_utf8(source).unwrap().lines() {
             let (line_to_write, found_match) = self.find_match(&line);
 
-            // Count the number of replacements we've made
-            replacements = if found_match {
-                replacements + 1
-            } else {
-                replacements
+            if found_match {
+                // Count the number of replacements we've made
+                replacements += 1;
+            } else if check_artifact {
+                // Only check if for artifacts if nothing else matches since it's almost impossible
+                // an artifact declaration would be on the same line as a package.
+                if let Some(artifact) = self.find_artifact_match(&line) {
+                    artifacts.push(artifact);
+                }
             };
             // Write out the potentially new line to the temp file
             writeln!(tempfile, "{}", &line_to_write)?;
@@ -170,7 +212,13 @@ impl Matcher {
             fs::set_permissions(tempfile.path(), metadata.permissions())?;
             tempfile.persist(&real_path)?;
         }
-        Ok(replacements)
+
+        Ok(MatchInfo {
+            matcher_id: self.id,
+            path,
+            matches_found: replacements,
+            artifacts_found: artifacts,
+        })
     }
 
     /// Given a line of code, return the potentially new line with androidx package names and if
@@ -211,36 +259,20 @@ impl Matcher {
         }
         (Cow::Borrowed(line), false)
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+    /// Given a line of code finds any artifacts that need to be updated. The matching
+    /// ArtifactMapping will be returned if there are any.
+    ///
+    /// * `line` - The source code line
+    fn find_artifact_match(&self, line: &str) -> Option<&'static ArtifactMapping> {
+        if line.len() >= *ARTIFACT_MIN_MATCH_LEN || ARTIFACT_MIN_MATCH.is_match(line) {
+            for mapping in ARTIFACT_MAPPINGS.iter() {
+                if mapping.pattern.find(line).is_some() {
+                    return Some(&mapping);
+                }
+            }
+        }
 
-    #[test]
-    fn match_line_returns_false_when_nothing_matches_in_the_line() {
-        let line = "import com.example.company.android.some.random.package";
-        let patterns = [Mapping {
-            pattern: Regex::new("android.support.wear.R").unwrap(),
-            replacement: "androidx.wear.R".to_string(),
-        }];
-        assert_eq!(
-            (Cow::Borrowed(line), false),
-            Matcher::new().match_line_with_patterns(&line, &patterns)
-        );
-    }
-
-    #[test]
-    fn match_line_returns_true_and_replaces_a_match() {
-        let line = "import android.support.wear.R;";
-        let patterns = [Mapping {
-            pattern: Regex::new("android.support.wear.R").unwrap(),
-            replacement: "androidx.wear.R".to_string(),
-        }];
-
-        assert_eq!(
-            (Cow::Borrowed("import androidx.wear.R;"), true),
-            Matcher::new().match_line_with_patterns(&line, &patterns)
-        );
+        None
     }
 }

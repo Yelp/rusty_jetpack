@@ -61,7 +61,7 @@ fn main() {
         thread::Builder::new()
             .name("matcher".to_string())
             .spawn(move || {
-                matcher::Matcher::new().run(i, rx_in, tx_main_clone);
+                matcher::Matcher::new(i, tx_main_clone).run(rx_in);
             })
             .unwrap();
     }
@@ -75,7 +75,7 @@ fn main() {
     let message = rx_finder.recv().unwrap();
     if !opts.quiet {
         println!(
-            "Found {} files (.java, .kt, .gradle, .pro)...",
+            "Found {} files (.gradle, .java, .kt, .pro, .xml)...",
             message.total_files_found
         );
     }
@@ -89,10 +89,26 @@ fn main() {
                     num_changes += match_info.matches_found;
                     num_files_changed += 1;
                 }
+
+                // Print out any artifacts found that need to be updated
+                if !match_info.artifacts_found.is_empty() {
+                    // Print to error so it can't be ignored
+                    eprintln!(
+                        "Found {} artifact(s) that must be updated in {}:",
+                        match_info.artifacts_found.len(),
+                        match_info.path.to_string_lossy()
+                    );
+                    match_info.artifacts_found.iter().for_each(|mapping| {
+                        // The longest artifact is 59 characters so pad for that
+                        eprintln!(
+                            "  * {:<60}=> {}",
+                            mapping.pattern.as_str(),
+                            mapping.replacement
+                        )
+                    });
+                }
             }
-            Err(e) => {
-                eprintln!("{}", e);
-            }
+            Err(e) => eprintln!("{}", e),
         };
     }
     let duration = start.elapsed();
