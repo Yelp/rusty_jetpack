@@ -74,7 +74,15 @@ lazy_static! {
         SUPPORT_MAPPINGS.last().unwrap().pattern.as_str().len();
     // Check most common boundaries to make sure false positives aren't found, e.g.
     // 'com.example.android.support'
-    static ref SUPPORT_MIN_MATCH: Regex = Regex::new(r#"[ </"@']android\.support"#).unwrap();
+    // Known bounderies:
+    // - " ": start of a new "word" and likely never a false postive
+    // - <: xml start tag
+    // - /: xml end tag
+    // - "/': start of strings or dependencies
+    // - @: annotations
+    // - ;: likely in lint baseline files for representing "<" or ">"
+    // - (: full path as a parameter to a function
+    static ref SUPPORT_MIN_MATCH: Regex = Regex::new(r#"[ </"@';(]android\.support"#).unwrap();
 
     // Regex and checks for databinding changes
     static ref DATABIND_MAPPINGS: Vec<Mapping> = {
@@ -89,7 +97,7 @@ lazy_static! {
     };
     static ref DATABIND_MIN_MATCH_LEN: usize =
         DATABIND_MAPPINGS.last().unwrap().pattern.as_str().len();
-    static ref DATABIND_MIN_MATCH: Regex = Regex::new(r#"[ </"@']android\.databinding"#).unwrap();
+    static ref DATABIND_MIN_MATCH: Regex = Regex::new(r#"[ </"@';(]android\.databinding"#).unwrap();
 
     // Regex and checks for architecture changes
     static ref ARCH_MAPPINGS: Vec<Mapping> = {
@@ -103,7 +111,7 @@ lazy_static! {
         vec
     };
     static ref ARCH_MIN_MATCH_LEN: usize = ARCH_MAPPINGS.last().unwrap().pattern.as_str().len();
-    static ref ARCH_MIN_MATCH: Regex = Regex::new(r#"[ </"@']android\.arch"#).unwrap();
+    static ref ARCH_MIN_MATCH: Regex = Regex::new(r#"[ </"@';(]android\.arch"#).unwrap();
 
     // Regex anc checks for artifact changes
     static ref ARTIFACT_MAPPINGS: Vec<ArtifactMapping> = {
@@ -183,7 +191,8 @@ impl Matcher {
             && (path.starts_with("buildSrc")
                 || path.parent().map_or(true, |x| x.parent().is_none()));
 
-        let mut tempfile = NamedTempFile::new_in(&path.parent().unwrap_or(&path))?;
+        // Create a simple "buffer" to write to as we change lines
+        let mut output = Vec::with_capacity(mmap.len());
         let mut replacements = 0;
         let mut artifacts: Vec<&'static ArtifactMapping> = Vec::new();
         for line in str::from_utf8(source).unwrap().lines() {
@@ -199,14 +208,19 @@ impl Matcher {
                     artifacts.push(artifact);
                 }
             };
-            // Write out the potentially new line to the temp file
-            writeln!(tempfile, "{}", &line_to_write)?;
+            // Write out to the buffer
+            writeln!(output, "{}", &line_to_write)?;
         }
 
-        // Make sure to only persist the temp file if anything actually changed
+        // Make sure to only create the temp file if anything actually changed
         if replacements > 0 {
+            let mut tempfile = NamedTempFile::new_in(&path.parent().unwrap_or(&path))?;
+
+            // Write out the changes to disk
+            tempfile.write_all(&output)?;
             tempfile.flush()?;
 
+            // Persist the tempfile and override the original
             let real_path = fs::canonicalize(&path)?;
             let metadata = fs::metadata(&real_path)?;
             fs::set_permissions(tempfile.path(), metadata.permissions())?;
