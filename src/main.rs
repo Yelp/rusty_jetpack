@@ -16,7 +16,7 @@ lazy_static! {
 
 #[derive(Debug, StructOpt)]
 #[structopt(name = "rusty_jetpack")]
-/// A fast and simple tool to assist in updating to Androidx.
+/// A fast and simple tool to assist in migrating to AndroidX.
 ///
 /// rusty_jetpack only seeks to replace all occurrences of support library classes with their
 /// updated Androidx locations. rusty_jetpack makes no attempts to update artifact and library

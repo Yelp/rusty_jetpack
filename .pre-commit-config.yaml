@@ -1,0 +1,40 @@
+---
+- repo: local
+  hooks:
+  - id: rust-clean
+    name: Rust clean
+    description: >
+      Run cargo clean so clippy will actually work. This does slowdown the
+      review/commit process.
+    entry: cargo clean
+    pass_filenames: false
+    types: [file, rust]
+    language: system
+  - id: rust-lint
+    name: Rust lint
+    description: Run cargo clippy. All warnings will be treated as errors.
+    entry: cargo clippy -- -D warnings
+    pass_filenames: false
+    types: [file, rust]
+    language: system
+  - id: rust-format
+    name: Rust Format
+    description: >
+      Run cargo fmt on files included in the commit. rustfmt should be
+      installed before-hand.
+    entry: cargo fmt --all --
+    pass_filenames: true
+    types: [file, rust]
+    language: system
+- repo: git@github.com:Yelp/detect-secrets
+  rev: v0.12.2
+  hooks:
+  - id: detect-secrets
+    args: ['--baseline', '.secrets.baseline']
+    exclude: Cargo.lock
+- repo: git@github.com:pre-commit/pre-commit-hooks
+  rev: v2.0.0
+  hooks:
+  - id: trailing-whitespace
+  - id: check-merge-conflict
+  - id: end-of-file-fixer
