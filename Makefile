@@ -14,5 +14,5 @@ install-hooks: .git/hooks/pre-commit
 	@true
 
 venv:
-	virtualenv venv
+	virtualenv venv -ppython3
 	./venv/bin/pip install pre-commit

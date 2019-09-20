@@ -27,14 +27,15 @@
     types: [file, rust]
     language: system
 - repo: git@github.com:Yelp/detect-secrets
-  rev: v0.12.2
+  rev: v0.12.6
   hooks:
   - id: detect-secrets
     args: ['--baseline', '.secrets.baseline']
     exclude: Cargo.lock
 - repo: git@github.com:pre-commit/pre-commit-hooks
-  rev: v2.0.0
+  rev: v2.3.0
   hooks:
   - id: trailing-whitespace
   - id: check-merge-conflict
   - id: end-of-file-fixer
+  - id: check-toml

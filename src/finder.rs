@@ -40,6 +40,7 @@ impl Finder {
                     || f.ends_with(".xml")
                     || f.ends_with(".pro")
                     || f.ends_with(".gradle")
+                    || f.ends_with("gradle.kts")
             })
             .map(PathBuf::from)
             .for_each(|f| {

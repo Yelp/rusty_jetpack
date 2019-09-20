@@ -1,13 +1,16 @@
-use crossbeam_channel::{bounded, unbounded, Sender};
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use lazy_static::lazy_static;
+use matcher::MatchInfo;
 use structopt::StructOpt;
 
 use std::cmp::min;
+use std::io::Result;
 use std::path::PathBuf;
 use std::thread;
 use std::time::Instant;
 
 mod finder;
+mod mappings;
 mod matcher;
 
 lazy_static! {
@@ -39,8 +42,19 @@ struct Opt {
 fn main() {
     let start = Instant::now();
 
-    // Parse the cli options
+    // Parse the cli options and start execution
     let opts = Opt::from_args();
+    let rx_matcher = start_execution(&opts);
+    listen_for_messages(start, &opts, rx_matcher);
+}
+
+/// Starts the execution of the matchers by creating a matcher per number of specified threads or
+/// the max number of threads available. It then spawns a finder to feed the matchers with files
+/// that can be migrated.
+///
+/// * opts - The CLI options passed in
+/// Returns the Receiver listening to the unbounded channel the matchers will respond on
+fn start_execution(opts: &Opt) -> Receiver<Result<MatchInfo>> {
     let num_threads = min(opts.threads.unwrap_or(*MAX_THREADS), *MAX_THREADS);
 
     if !opts.quiet {
@@ -75,11 +89,21 @@ fn main() {
     let message = rx_finder.recv().unwrap();
     if !opts.quiet {
         println!(
-            "Found {} files (.gradle, .java, .kt, .pro, .xml)...",
+            "Found {} files (.gradle, .gradle.kts, .java, .kt, .pro, .xml)...",
             message.total_files_found
         );
     }
 
+    rx_matcher
+}
+
+/// Listens to the given Receiver for MatchInfo messages, printing useful output to stdout and
+/// stderr if necessary.
+///
+/// * start - The instant the program started
+/// * opts - The CLI options passed in
+/// * rx_matcher - The Receiver to listen to
+fn listen_for_messages(start: Instant, opts: &Opt, rx_matcher: Receiver<Result<MatchInfo>>) {
     let mut num_files_changed = 0;
     let mut num_changes = 0;
     while let Ok(message) = rx_matcher.recv() {
@@ -88,6 +112,20 @@ fn main() {
                 if match_info.matches_found > 0 {
                     num_changes += match_info.matches_found;
                     num_files_changed += 1;
+                }
+
+                // Print out any star imports found
+                if !match_info.matched_star_imports.is_empty() {
+                    eprintln!(
+                        "Found {} star import(s) that must be updated in {}:",
+                        match_info.matched_star_imports.len(),
+                        match_info.path.to_string_lossy()
+                    );
+
+                    match_info
+                        .matched_star_imports
+                        .iter()
+                        .for_each(|line| eprintln!("  * {}", line));
                 }
 
                 // Print out any artifacts found that need to be updated
@@ -111,6 +149,8 @@ fn main() {
             Err(e) => eprintln!("{}", e),
         };
     }
+
+    // Report final stats of the run
     let duration = start.elapsed();
     if !opts.quiet {
         println!(

@@ -1,6 +1,6 @@
 [package]
 name = "rusty_jetpack"
-version = "1.1.1"
+version = "1.2.0"
 authors = ["Kurt Bonatz <kbonatz@yelp.com>"]
 edition = "2018"
 readme = "README.md"
@@ -15,6 +15,6 @@ memmap = "0.7"
 num_cpus = "1"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
-serde_regex = "0.3"
-structopt = "0.2"
+serde_regex = "0.4"
+structopt = "0.3"
 tempfile = "3"

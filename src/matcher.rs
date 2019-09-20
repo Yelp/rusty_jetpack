@@ -1,9 +1,11 @@
+use crate::mappings::{
+    ArtifactMapping, Mapping, ARCH_MAPPINGS, ARCH_MIN_MATCH, ARCH_MIN_MATCH_LEN, ARTIFACT_MAPPINGS,
+    ARTIFACT_MIN_MATCH, ARTIFACT_MIN_MATCH_LEN, DATABIND_MAPPINGS, DATABIND_MIN_MATCH,
+    DATABIND_MIN_MATCH_LEN, STAR_IMPORT_MATCH, SUPPORT_MAPPINGS, SUPPORT_MIN_MATCH,
+    SUPPORT_MIN_MATCH_LEN,
+};
 use crossbeam_channel::{Receiver, Sender};
-use lazy_static::lazy_static;
 use memmap::MmapOptions;
-use regex::{Regex, RegexSet};
-use serde::Deserialize;
-use serde_regex;
 use tempfile::NamedTempFile;
 
 use std::borrow::Cow;
@@ -15,128 +17,12 @@ use std::path::PathBuf;
 use std::str;
 use std::vec::Vec;
 
-// Include the csv mapping files. They are separated by the first difference in their package
-// names: android.support, android.databinding, and android.arch. While not a massive difference
-// in performance, separating them out does trim the total amount of regex that needs to be
-// searched per line. This is especially true with the support library given it is the majority of
-// package name changes and used the most frequently in files.
-const SUPPORT_MAPPING_CSV: &str = include_str!("../android_support_mappings.csv");
-const DATABIND_MAPPING_CSV: &str = include_str!("../android_databinding_mappings.csv");
-const ARCH_MAPPING_CSV: &str = include_str!("../android_arch_mappings.csv");
-
-// Also include the artifact mappings so it's easy to know what packages you actually need to
-// replace. Since it's quite a bit more complex than just find and replace for the artifacts,
-// printing out the ones actually used in the project is good enough.
-const ARTIFACT_MAPPING_CSV: &str = include_str!("../android_artifact_mappings.csv");
-
-#[derive(Debug, Deserialize)]
-struct Mapping {
-    #[serde(with = "serde_regex", rename = "Support Library class")]
-    pattern: Regex,
-    #[serde(rename = "Android X class")]
-    replacement: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ArtifactMapping {
-    #[serde(with = "serde_regex", rename = "Old build artifact")]
-    pub pattern: Regex,
-    #[serde(rename = "AndroidX build artifact")]
-    pub replacement: String,
-}
-
-// Compiling the regex patterns is decently expensive and since they are used across all possible
-// threads they are set up as static references so they are only created once.
-//
-// Some simple heuristics are also done to short circuit searching all the patterns in an attempt
-// to speed up performance. They are simply just the minimum string length to match as well as the
-// minimum pattern to even begin checking all the patterns. For example, if the minimum length of a
-// pattern in the support library is 30 characters we shouldn't even bother searching the line if
-// it is only 25 characters long. Similarly, the minimum match for the support library changes is
-// "android.support" and if that isn't in the line then no other support library patterns will
-// match either.
-lazy_static! {
-    // Regex and checks for support library changes
-    static ref SUPPORT_MAPPINGS: Vec<Mapping> = {
-        let mut vec = Vec::new();
-        let mut rdr = csv::Reader::from_reader(SUPPORT_MAPPING_CSV.as_bytes());
-        for result in rdr.deserialize() {
-            let mapping: Mapping = result.unwrap();
-            vec.push(mapping)
-        }
-        // Sort with longest pattern first. This prevents collisions and false mappings in cases
-        // like "Toolbar" and "ToolbarWidgetWrapper". Sorting is in theory less expensive to do
-        // once then have a more complex pattern that checks for boundaries.
-        vec.sort_unstable_by(|a, b| b.pattern.as_str().len().cmp(&a.pattern.as_str().len()));
-        vec
-    };
-    static ref SUPPORT_MIN_MATCH_LEN: usize =
-        SUPPORT_MAPPINGS.last().unwrap().pattern.as_str().len();
-    // Check most common boundaries to make sure false positives aren't found, e.g.
-    // 'com.example.android.support'
-    // Known bounderies:
-    // - " ": start of a new "word" and likely never a false postive
-    // - <: xml start tag
-    // - /: xml end tag
-    // - "/': start of strings or dependencies
-    // - @: annotations
-    // - ;: likely in lint baseline files for representing "<" or ">"
-    // - (: full path as a parameter to a function
-    static ref SUPPORT_MIN_MATCH: Regex = Regex::new(r#"[ </"@';(]android\.support"#).unwrap();
-
-    // Regex and checks for databinding changes
-    static ref DATABIND_MAPPINGS: Vec<Mapping> = {
-        let mut vec = Vec::new();
-        let mut rdr = csv::Reader::from_reader(DATABIND_MAPPING_CSV.as_bytes());
-        for result in rdr.deserialize() {
-            let mapping: Mapping = result.unwrap();
-            vec.push(mapping)
-        }
-        vec.sort_unstable_by(|a, b| b.pattern.as_str().len().cmp(&a.pattern.as_str().len()));
-        vec
-    };
-    static ref DATABIND_MIN_MATCH_LEN: usize =
-        DATABIND_MAPPINGS.last().unwrap().pattern.as_str().len();
-    static ref DATABIND_MIN_MATCH: Regex = Regex::new(r#"[ </"@';(]android\.databinding"#).unwrap();
-
-    // Regex and checks for architecture changes
-    static ref ARCH_MAPPINGS: Vec<Mapping> = {
-        let mut vec = Vec::new();
-        let mut rdr = csv::Reader::from_reader(ARCH_MAPPING_CSV.as_bytes());
-        for result in rdr.deserialize() {
-            let mapping: Mapping = result.unwrap();
-            vec.push(mapping)
-        }
-        vec.sort_unstable_by(|a, b| b.pattern.as_str().len().cmp(&a.pattern.as_str().len()));
-        vec
-    };
-    static ref ARCH_MIN_MATCH_LEN: usize = ARCH_MAPPINGS.last().unwrap().pattern.as_str().len();
-    static ref ARCH_MIN_MATCH: Regex = Regex::new(r#"[ </"@';(]android\.arch"#).unwrap();
-
-    // Regex anc checks for artifact changes
-    static ref ARTIFACT_MAPPINGS: Vec<ArtifactMapping> = {
-        let mut vec = Vec::new();
-        let mut rdr = csv::Reader::from_reader(ARTIFACT_MAPPING_CSV.as_bytes());
-        for result in rdr.deserialize() {
-            let mapping: ArtifactMapping = result.unwrap();
-            vec.push(mapping)
-        }
-        vec.sort_unstable_by(|a, b| b.pattern.as_str().len().cmp(&a.pattern.as_str().len()));
-        vec
-    };
-    static ref ARTIFACT_MIN_MATCH_LEN: usize =
-        ARTIFACT_MAPPINGS.last().unwrap().pattern.as_str().len();
-    static ref ARTIFACT_MIN_MATCH: RegexSet = RegexSet::new(&[
-        r#"["'']com\.android\.support[a-z\.]*:"#,
-        r#"["']android\.arch[a-z\.]*:"#
-    ]).unwrap();
-}
-
 pub struct MatchInfo {
     pub matcher_id: usize,
     pub path: PathBuf,
     pub matches_found: usize,
     pub artifacts_found: Vec<&'static ArtifactMapping>,
+    pub matched_star_imports: Vec<String>,
 }
 
 pub struct Matcher {
@@ -172,10 +58,11 @@ impl Matcher {
     /// that most source code files are less than 1 MB. Each line is then scanned for any of the
     /// migrated package names and updated to the new androidx package name.
     ///
-    /// All updates to the file are first done in a temporary file in the extremely unlikely chance
-    /// that another program is also accessing the file while we are modifying it. If no changes
-    /// are made, the temporary file is never persisted. Otherwise, the temporary is persisted to
-    /// disk and overwrites the original file with the same attributes.
+    /// All updates to the file are first done in memory for performance and in the extremely
+    /// unlikely chance that another program is also accessing the file while we are modifying it.
+    /// If there are changes that need to be made to the file, the new contents are written to a
+    /// temporary file which is then persisted to disk and overwrites the original file with the
+    /// same attributes.
     ///
     /// * `path` - The file path to operate on
     /// Returns a MatchInfo with information about any matches in the line if successful
@@ -188,26 +75,28 @@ impl Matcher {
         // can only be located in the buildSrc directory, a top level file in the project or one
         // level down for module's build files.
         let check_artifact = path.extension().map_or(false, |x| x != "xml" && x != "pro")
-            && (path.starts_with("buildSrc")
-                || path.parent().map_or(true, |x| x.parent().is_none()));
+            && (path.starts_with("buildSrc") || path.iter().count() <= 2);
 
         // Create a simple "buffer" to write to as we change lines
         let mut output = Vec::with_capacity(mmap.len());
         let mut replacements = 0;
         let mut artifacts: Vec<&'static ArtifactMapping> = Vec::new();
+        let mut star_imports: Vec<String> = Vec::new();
         for line in str::from_utf8(source).unwrap().lines() {
-            let (line_to_write, found_match) = self.find_match(&line);
+            let (line_to_write, found_match, found_star_import) = self.find_match(&line);
 
             if found_match {
                 // Count the number of replacements we've made
                 replacements += 1;
+            } else if found_star_import {
+                star_imports.push(String::from(line));
             } else if check_artifact {
-                // Only check if for artifacts if nothing else matches since it's almost impossible
-                // an artifact declaration would be on the same line as a package.
+                // Only check for artifacts if nothing else matches since it's almost impossible an
+                // artifact declaration would be on the same line as a package.
                 if let Some(artifact) = self.find_artifact_match(&line) {
                     artifacts.push(artifact);
                 }
-            };
+            }
             // Write out to the buffer
             writeln!(output, "{}", &line_to_write)?;
         }
@@ -232,28 +121,30 @@ impl Matcher {
             path,
             matches_found: replacements,
             artifacts_found: artifacts,
+            matched_star_imports: star_imports,
         })
     }
 
-    /// Given a line of code, return the potentially new line with androidx package names and if
-    /// that replacement occurred.
+    /// Given a line of code, return the potentially new line with androidx package names, if that
+    /// replacement occurred, and if a star import that matched was found (which is not replacable).
     ///
     /// * `line` - The source code line
-    fn find_match<'a>(&self, line: &'a str) -> (Cow<'a, str>, bool) {
+    fn find_match<'a>(&self, line: &'a str) -> (Cow<'a, str>, bool, bool) {
         // Do some simple heuristics to make sure it even worth checking the full set of patterns
-        if line.len() >= *SUPPORT_MIN_MATCH_LEN && SUPPORT_MIN_MATCH.is_match(line) {
+        if line.trim().len() >= *SUPPORT_MIN_MATCH_LEN && SUPPORT_MIN_MATCH.is_match(line) {
             self.match_line_with_patterns(line, &*SUPPORT_MAPPINGS)
-        } else if line.len() >= *ARCH_MIN_MATCH_LEN && ARCH_MIN_MATCH.is_match(line) {
+        } else if line.trim().len() >= *ARCH_MIN_MATCH_LEN && ARCH_MIN_MATCH.is_match(line) {
             self.match_line_with_patterns(line, &*ARCH_MAPPINGS)
-        } else if line.len() >= *DATABIND_MIN_MATCH_LEN && DATABIND_MIN_MATCH.is_match(line) {
+        } else if line.trim().len() >= *DATABIND_MIN_MATCH_LEN && DATABIND_MIN_MATCH.is_match(line)
+        {
             self.match_line_with_patterns(line, &*DATABIND_MAPPINGS)
         } else {
-            (Cow::Borrowed(line), false)
+            (Cow::Borrowed(line), false, false)
         }
     }
 
     /// Given a line of code, return it with the first, if any, mapping found in the list of
-    /// patterns to check and whether a replacement occurred.
+    /// patterns to check, whether a replacement occurred, and if the line contained a star import.
     ///
     /// * `line` - The source code line
     /// * `patterns` - An array of patterns mapped to replacements
@@ -261,17 +152,23 @@ impl Matcher {
         &self,
         line: &'a str,
         patterns: &'b [Mapping],
-    ) -> (Cow<'a, str>, bool) {
+    ) -> (Cow<'a, str>, bool, bool) {
+        // Fast fail on star import that matches one of the migration minimum matchings
+        if STAR_IMPORT_MATCH.is_match(line) {
+            return (Cow::Borrowed(line), false, true);
+        }
+
         for mapping in patterns.iter() {
             // Finish fast, it's very unlikely that there will be more than one match on a line
-            if mapping.pattern.find(&line).is_some() {
+            if mapping.pattern.is_match(&line) {
                 return (
                     mapping.pattern.replace(line, mapping.replacement.as_str()),
                     true,
+                    false,
                 );
             }
         }
-        (Cow::Borrowed(line), false)
+        (Cow::Borrowed(line), false, false)
     }
 
     /// Given a line of code finds any artifacts that need to be updated. The matching
@@ -279,7 +176,7 @@ impl Matcher {
     ///
     /// * `line` - The source code line
     fn find_artifact_match(&self, line: &str) -> Option<&'static ArtifactMapping> {
-        if line.len() >= *ARTIFACT_MIN_MATCH_LEN || ARTIFACT_MIN_MATCH.is_match(line) {
+        if line.trim().len() >= *ARTIFACT_MIN_MATCH_LEN && ARTIFACT_MIN_MATCH.is_match(line) {
             for mapping in ARTIFACT_MAPPINGS.iter() {
                 if mapping.pattern.find(line).is_some() {
                     return Some(&mapping);
@@ -288,5 +185,331 @@ impl Matcher {
         }
 
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossbeam_channel::unbounded;
+    use std::fs;
+    use tempfile::Builder;
+
+    // search_and_replace tests
+
+    #[test]
+    fn build_file_suggets_replacement() {
+        // Set up the test file
+        let mut file = Builder::new()
+            .prefix("build")
+            .suffix(".gradle")
+            .tempfile_in("")
+            .unwrap();
+        file.write_all(
+            "dependencies {
+                implemenation 'com.android.support:support-compat:28.0.0'
+            }\n"
+            .as_bytes(),
+        )
+        .unwrap();
+        file.flush().unwrap();
+
+        // Run it
+        let path_buf = file.path().to_path_buf();
+        let path = path_buf.file_name().unwrap();
+        let match_info = create_matcher()
+            .search_and_replace(PathBuf::from(path))
+            .unwrap();
+
+        assert!(match_info.matches_found == 0);
+        assert!(match_info.artifacts_found.len() == 1);
+        assert!(match_info
+            .artifacts_found
+            .first()
+            .unwrap()
+            .replacement
+            .contains("androidx.core:core:"));
+    }
+
+    #[test]
+    fn xml_file_has_instance_replaced() {
+        // Set up the test file
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(
+            "<android.support.design.widget.CoordinatorLayout
+                android:layout_width=\"match_parent\"
+                android:layout_height=\"match_parent\">
+            </android.support.design.widget.CoordinatorLayout>\n"
+                .as_bytes(),
+        )
+        .unwrap();
+        file.flush().unwrap();
+
+        // Run it
+        let path = file.path().to_path_buf();
+        let match_info = create_matcher().search_and_replace(path.clone()).unwrap();
+
+        let expected = "<androidx.coordinatorlayout.widget.CoordinatorLayout
+                android:layout_width=\"match_parent\"
+                android:layout_height=\"match_parent\">
+            </androidx.coordinatorlayout.widget.CoordinatorLayout>\n";
+
+        let contents = fs::read_to_string(path).unwrap();
+
+        assert!(match_info.matches_found == 2);
+        assert!(match_info.matched_star_imports.len() == 0);
+        assert_eq!(contents, expected);
+    }
+
+    #[test]
+    fn proguard_file_has_several_instances_replaced() {
+        // Set up the test file
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(
+            "-keep class android.support.v4.app.Fragment { *; }
+            -keep android.support.design.drawable.DrawableUtils
+            -dontwarn android.support.design.**
+            -keepclassmembers,allowobfuscation class * extends android.arch.lifecycle.ViewModel\n"
+                .as_bytes(),
+        )
+        .unwrap();
+        file.flush().unwrap();
+
+        // Run it
+        let path = file.path().to_path_buf();
+        let match_info = create_matcher().search_and_replace(path.clone()).unwrap();
+
+        let expected = "-keep class androidx.fragment.app.Fragment { *; }
+            -keep com.google.android.material.drawable.DrawableUtils
+            -dontwarn android.support.design.**
+            -keepclassmembers,allowobfuscation class * extends androidx.lifecycle.ViewModel\n";
+
+        let contents = fs::read_to_string(path).unwrap();
+
+        assert!(match_info.matches_found == 3);
+        assert!(match_info.matched_star_imports.len() == 1);
+        assert_eq!(
+            match_info.matched_star_imports.first().unwrap(),
+            "            -dontwarn android.support.design.**"
+        );
+        assert_eq!(contents, expected);
+    }
+
+    #[test]
+    fn java_source_file_has_several_instances_replaced() {
+        // Set up the test file
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(
+            "package com.example.java;
+
+            public class ExampleActivity extends android.support.v4.app.ActivityCompat {
+                @android.support.annotation.NonNull
+                public void doSomething(android.support.constraint.ConstraintSet set) { }
+            }\n"
+            .as_bytes(),
+        )
+        .unwrap();
+        file.flush().unwrap();
+
+        // Run it
+        let path = file.path().to_path_buf();
+        let match_info = create_matcher().search_and_replace(path.clone()).unwrap();
+
+        let expected = "package com.example.java;
+
+            public class ExampleActivity extends androidx.core.app.ActivityCompat {
+                @androidx.annotation.NonNull
+                public void doSomething(androidx.constraintlayout.widget.ConstraintSet set) { }
+            }\n";
+        let contents = fs::read_to_string(path).unwrap();
+
+        assert!(match_info.matches_found == 3);
+        assert!(match_info.matched_star_imports.len() == 0);
+        assert_eq!(contents, expected);
+    }
+
+    #[test]
+    fn kotlin_source_file_has_several_instances_replaced() {
+        // Set up the test file
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(
+            "package com.example.kotlin
+            import com.example.package
+            import android.arch.lifecycle.ViewModel
+            import android.databinding.*
+
+            /**
+             * Might or might not use [android.databinding.ObservableInt].
+             */
+            class Example {
+                @set:android.support.annotation.VisibleForTesting
+                var something: String? = null
+            }\n"
+            .as_bytes(),
+        )
+        .unwrap();
+        file.flush().unwrap();
+
+        // Run it
+        let path = file.path().to_path_buf();
+        let match_info = create_matcher().search_and_replace(path.clone()).unwrap();
+
+        let expected = "package com.example.kotlin
+            import com.example.package
+            import androidx.lifecycle.ViewModel
+            import android.databinding.*
+
+            /**
+             * Might or might not use [androidx.databinding.ObservableInt].
+             */
+            class Example {
+                @set:androidx.annotation.VisibleForTesting
+                var something: String? = null
+            }\n";
+        let contents = fs::read_to_string(path).unwrap();
+
+        assert!(match_info.matches_found == 3);
+        assert!(match_info.matched_star_imports.len() == 1);
+        assert_eq!(contents, expected);
+    }
+
+    // find_match/match_line_with_patterns tests
+
+    #[test]
+    fn xml_matching_is_replaced() {
+        let matcher = create_matcher();
+        let line = "</android.support.constraint.ConstraintLayout>";
+        let new_line = "</androidx.constraintlayout.widget.ConstraintLayout>";
+        let (replacement, changed, found_star) = matcher.find_match(line);
+
+        assert_eq!(replacement, new_line);
+        assert!(changed);
+        assert!(!found_star)
+    }
+
+    #[test]
+    fn annotation_matching_is_replaced() {
+        let matcher = create_matcher();
+        let line = "        @set:android.support.annotation.VisibleForTesting";
+        let new_line = "        @set:androidx.annotation.VisibleForTesting";
+        let (replacement, changed, found_star) = matcher.find_match(line);
+
+        assert_eq!(replacement, new_line);
+        assert!(changed);
+        assert!(!found_star)
+    }
+
+    #[test]
+    fn kdoc_comment_matching_is_replaced() {
+        let matcher = create_matcher();
+        let line = "* uses [android.arch.lifecycle.ViewModel] to do stuff.";
+        let new_line = "* uses [androidx.lifecycle.ViewModel] to do stuff.";
+        let (replacement, changed, found_star) = matcher.find_match(line);
+
+        assert_eq!(replacement, new_line);
+        assert!(changed);
+        assert!(!found_star);
+    }
+
+    #[test]
+    fn proguard_matching_line_is_replaced() {
+        let matcher = create_matcher();
+        let line = "-keep public class * extends android.support.v4.app.Fragment";
+        let new_line = "-keep public class * extends androidx.fragment.app.Fragment";
+        let (replacement, changed, found_star) = matcher.find_match(line);
+
+        assert_eq!(replacement, new_line);
+        assert!(changed);
+        assert!(!found_star);
+    }
+
+    #[test]
+    fn import_matching_is_replaced() {
+        let matcher = create_matcher();
+        let line = "import android.support.animation.Force;";
+        let new_line = "import androidx.dynamicanimation.animation.Force;";
+        let (replacement, changed, found_star) = matcher.find_match(line);
+
+        assert_eq!(replacement, new_line);
+        assert!(changed);
+        assert!(!found_star)
+    }
+
+    #[test]
+    fn field_matching_is_replaced() {
+        let matcher = create_matcher();
+        let line = "val page: android.arch.paging.PageResult? = null";
+        let new_line = "val page: androidx.paging.PageResult? = null";
+        let (replacement, changed, found_star) = matcher.find_match(line);
+
+        assert_eq!(replacement, new_line);
+        assert!(changed);
+        assert!(!found_star)
+    }
+
+    #[test]
+    fn function_param_matching_is_replaced() {
+        let matcher = create_matcher();
+        let line = "public void (android.databinding.Observable obs) {";
+        let new_line = "public void (androidx.databinding.Observable obs) {";
+        let (replacement, changed, found_star) = matcher.find_match(line);
+
+        assert_eq!(replacement, new_line);
+        assert!(changed);
+        assert!(!found_star)
+    }
+
+    #[test]
+    fn too_short_of_line_is_ignored() {
+        let matcher = create_matcher();
+        let line = "}";
+        let (replacement, changed, found_star) = matcher.find_match(line);
+
+        assert_eq!(replacement, line);
+        assert!(!changed);
+        assert!(!found_star)
+    }
+
+    #[test]
+    fn star_import_gives_back_same_line() {
+        let matcher = create_matcher();
+        let line = "import android.support.annotation.*";
+        let (replacement, changed, found_star) = matcher.find_match(line);
+
+        assert_eq!(replacement, line);
+        assert!(!changed);
+        assert!(found_star)
+    }
+
+    // find_artifact_match tests
+
+    #[test]
+    fn artifact_line_returns_mapping() {
+        let matcher = create_matcher();
+        let line = r#"    implemenation "com.android.support:car:28.0.0""#;
+
+        assert!(matcher.find_artifact_match(line).is_some())
+    }
+
+    #[test]
+    fn artifact_line_with_single_quote_returns_mapping() {
+        let matcher = create_matcher();
+        let line = "    implemenation 'com.android.support:car:$version'";
+
+        assert!(matcher.find_artifact_match(line).is_some())
+    }
+
+    #[test]
+    fn false_positive_artifact_line_returns_none() {
+        let matcher = create_matcher();
+        let line = r#"val LIB = "com.example.android.support:lib:$VERSION""#;
+
+        assert!(matcher.find_artifact_match(line).is_none())
+    }
+
+    fn create_matcher() -> Matcher {
+        let (tx, _) = unbounded();
+
+        Matcher { id: 0, tx }
     }
 }

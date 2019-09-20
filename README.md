@@ -15,11 +15,11 @@ large code base.
 
 ### How it works
 
-Relevant (`.gradle`, `.java`, `.kt`, `.pro`, `.xml`) files are found through
-`git ls-files` and are distributed evenly to a thread pool. Each thread employs
-a [Matcher](src/matcher.rs) that sequentially loads the file into a memory map.
-The file is then read line by line and matches are replaced according to
-Android's provided
+Relevant (`.gradle`, `gradle.kts`, `.java`, `.kt`, `.pro`, `.xml`) files are
+found through `git ls-files` and are distributed evenly to a thread pool. Each
+thread employs a [Matcher](src/matcher.rs) that sequentially loads the file
+into a memory map.  The file is then read line by line and matches are replaced
+according to Android's provided
 [class](https://developer.android.com/topic/libraries/support-library/downloads/androidx-class-mapping.csv)
 mapping CSV file. Only files that change are then written back to disk.
 
@@ -30,8 +30,8 @@ and what the library should be updated to are printed to STDERR.
 
 Since only explicit mappings are used, it is still recommended to use the
 provided tool to verify as many cases are found when initial migration is
-started. rusty_jetpack can then be distributed to developers or deployed on CI
-to significantly decrease adoption and migration time.
+started. rusty_jetpack can then be distributed to developers to significantly
+decrease adoption and migration time.
 
 ## Usage
 ### Installation
@@ -40,18 +40,18 @@ rusty_jetpack is written in [Rust](https://www.rust-lang.org/). It was written
 with `rustc` version 1.33.0, but can be built with version 1.31.0 or higher.
 The recommended way to install Rust is from the [official installation page](https://www.rust-lang.org/tools/install).
 
-With Rust installed, installation is can be done by cloning the repository and
+With Rust installed, installation can be done by cloning the repository and
 then installing via `cargo install`. You should then be able to run
 rusty_jetpack if cargo is part of your `$PATH`.
 ```sh
-cargo install --git git@github.com/Yelp/rusty_jetpack.git
+cargo install --git https://github.com/Yelp/rusty_jetpack.git
 ```
 
 ### Command line usage
 
 Usage is as simple as calling `rusty_jetpack` in the root of your Android repository.
 
-### Uninstallation
+### Uninstalling
 
 It can then be unistalled by simply calling `cargo uninstall rusty_jetpack`.
 
@@ -70,8 +70,9 @@ performance. All results were taken on a 2018 MacBook Pro with 32GB of RAM and
 * `git ls-files` is used to determine which files to operate on. Therefore,
 this tool will not operate on projects not managed by git and will also ignore
 submodules and untracked files.
-* Star imports, star proguard rules, and internal packages are not handled
-since exact matches are required to map to the correct AndroidX class
+* Star imports and star proguard rules are not migrated since exact matches are
+required to map to the correct AndroidX class. Though a warning about them will
+be printed.
 * Carriage return line feeds (`\r\n`, CRLF) are not respected and will be
 replaced with plain line feeds (`\n`, LF). As such Windows based projects are
 not fully supported and might experience unexpected changes. See
